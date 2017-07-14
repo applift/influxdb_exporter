@@ -42,6 +42,8 @@ var (
 	metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose Prometheus metrics.")
 	sampleExpiry  = flag.Duration("influxdb.sample-expiry", 5*time.Minute, "How long a sample is valid for.")
 	bindAddress   = flag.String("udp.bind-address", ":9122", "Address on which to listen for udp packets.")
+	databaseLabel = flag.String("influxdb.database-label", "", "Database label to add. Leave empty to disable")
+
 	lastPush      = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "influxdb_last_push_timestamp_seconds",
@@ -88,7 +90,7 @@ func (c *influxDBCollector) serveUdp() {
 				return
 			}
 
-			c.parsePointsToSample(points)
+			c.parsePointsToSample(points, "udp")
 		}
 	}
 }
@@ -98,14 +100,17 @@ type influxDBCollector struct {
 	mu      sync.Mutex
 	ch      chan *influxDBSample
 
+	databaseLabel string
+
 	// Udp
 	conn *net.UDPConn
 }
 
-func newInfluxDBCollector() *influxDBCollector {
+func newInfluxDBCollector(databaseLabel string) *influxDBCollector {
 	c := &influxDBCollector{
 		ch:      make(chan *influxDBSample),
 		samples: map[string]*influxDBSample{},
+		databaseLabel: databaseLabel,
 	}
 	go c.processSamples()
 	return c
@@ -128,14 +133,13 @@ func (c *influxDBCollector) influxDBPost(w http.ResponseWriter, r *http.Request)
 		http.Error(w, fmt.Sprintf("error parsing request: %s", err), 400)
 		return
 	}
-
-	c.parsePointsToSample(points)
+	c.parsePointsToSample(points, r.FormValue("db"))
 
 	// InfluxDB returns a 204 on success.
 	http.Error(w, "", 204)
 }
 
-func (c *influxDBCollector) parsePointsToSample(points []models.Point) {
+func (c *influxDBCollector) parsePointsToSample(points []models.Point, db string) {
 	for _, s := range points {
 		for field, v := range s.Fields() {
 			var value float64
@@ -166,6 +170,9 @@ func (c *influxDBCollector) parsePointsToSample(points []models.Point) {
 				Timestamp: s.Time(),
 				Value:     value,
 				Labels:    map[string]string{},
+			}
+			if c.databaseLabel != "" && db != "" {
+				sample.Labels[c.databaseLabel] = db
 			}
 			for k, v := range s.Tags() {
 				sample.Labels[invalidChars.ReplaceAllString(k, "_")] = v
@@ -257,7 +264,7 @@ func main() {
 	log.Infoln("Starting influxdb_exporter", version.Info())
 	log.Infoln("Build context", version.BuildContext())
 
-	c := newInfluxDBCollector()
+	c := newInfluxDBCollector(*databaseLabel)
 	prometheus.MustRegister(c)
 
 	addr, err := net.ResolveUDPAddr("udp", *bindAddress)
